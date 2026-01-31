@@ -1,5 +1,7 @@
 Role Index
 ==========
 
- * :doc:`keycloak`
- * :doc:`keycloak_realm`
+.. toctree::
+    keycloak
+    keycloak_quarkus
+    keycloak_realm
