@@ -107,7 +107,7 @@
         client_id: "{{ rhn_username }}"
         client_secret: "{{ rhn_password }}"
         product_type: DISTRIBUTION
-        product_version: "{{ rhbk_version }}"
+        product_version: "{{ rhbk_version.split('.')[0] }}"
         product_category: "{{ rhbk_product_category }}"
       register: rhn_products
       no_log: "{{ omit_rhn_output | default(true) }}"
@@ -116,21 +116,34 @@
 
     - name: Determine install zipfile from search results
       ansible.builtin.set_fact:
-        rhn_filtered_products: "{{ rhn_products.results | selectattr('file_path', 'match', '[^/]*/' + rhbk_archive + '$') }}"
+        rhn_filtered_products: "{{ rhn_products.results | selectattr('file_path', 'match', '(.*/)?' + rhbk_archive + '$') | list }}"
       delegate_to: localhost
       run_once: true
+
+    - name: Fail when no Red Hat Build of Keycloak product matches
+      ansible.builtin.fail:
+        msg: >-
+          No Red Hat Build of Keycloak product found for archive '{{ rhbk_archive }}' (version {{ rhbk_version }}, product_version {{ rhbk_version.split('.')[0] }}).
+          Check that rhbk_version and rhbk_archive match a product available for your subscription,
+          and that rhn_username/rhn_password have access to product category '{{ rhbk_product_category }}'.
+          Search returned {{ rhn_products.results | default([]) | length }} product(s).
+      when: rhn_filtered_products | length == 0
 
     - name: Download Red Hat Build of Keycloak
       middleware_automation.common.product_download: # noqa risky-file-permissions delegated, uses controller host user
         client_id: "{{ rhn_username }}"
         client_secret: "{{ rhn_password }}"
         product_id: "{{ (rhn_filtered_products | first).id }}"
+        product_category: "{{ rhbk_product_category }}"
+        product_type: DISTRIBUTION
+        product_version: "{{ rhbk_version.split('.')[0] }}"
         dest: "{{ local_path.stat.path }}/{{ keycloak.bundle }}"
         mode: '0640'
       no_log: "{{ omit_rhn_output | default(true) }}"
       delegate_to: localhost
       run_once: true
       become: false
+      when: rhn_filtered_products | length > 0
 
 - name: Perform download of RHBK from alternate download location
   delegate_to: localhost
