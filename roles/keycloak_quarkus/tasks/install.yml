@@ -107,7 +107,7 @@
         client_id: "{{ rhn_username }}"
         client_secret: "{{ rhn_password }}"
         product_type: DISTRIBUTION
-        product_version: "{{ rhbk_version }}"
+        product_version: "{{ rhbk_version.split('.')[0] }}"
         product_category: "{{ rhbk_product_category }}"
       register: rhn_products
       no_log: "{{ omit_rhn_output | default(true) }}"
@@ -116,21 +116,34 @@
 
     - name: Determine install zipfile from search results
       ansible.builtin.set_fact:
-        rhn_filtered_products: "{{ rhn_products.results | selectattr('file_path', 'match', '[^/]*/' + rhbk_archive + '$') }}"
+        rhn_filtered_products: "{{ rhn_products.results | selectattr('file_path', 'match', '(.*/)?' + rhbk_archive + '$') | list }}"
       delegate_to: localhost
       run_once: true
+
+    - name: Fail when no Red Hat Build of Keycloak product matches
+      ansible.builtin.fail:
+        msg: >-
+          No Red Hat Build of Keycloak product found for archive '{{ rhbk_archive }}' (version {{ rhbk_version }}, product_version {{ rhbk_version.split('.')[0] }}).
+          Check that rhbk_version and rhbk_archive match a product available for your subscription,
+          and that rhn_username/rhn_password have access to product category '{{ rhbk_product_category }}'.
+          Search returned {{ rhn_products.results | default([]) | length }} product(s).
+      when: rhn_filtered_products | length == 0
 
     - name: Download Red Hat Build of Keycloak
       middleware_automation.common.product_download: # noqa risky-file-permissions delegated, uses controller host user
         client_id: "{{ rhn_username }}"
         client_secret: "{{ rhn_password }}"
         product_id: "{{ (rhn_filtered_products | first).id }}"
+        product_category: "{{ rhbk_product_category }}"
+        product_type: DISTRIBUTION
+        product_version: "{{ rhbk_version.split('.')[0] }}"
         dest: "{{ local_path.stat.path }}/{{ keycloak.bundle }}"
         mode: '0640'
       no_log: "{{ omit_rhn_output | default(true) }}"
       delegate_to: localhost
       run_once: true
       become: false
+      when: rhn_filtered_products | length > 0
 
 - name: Perform download of RHBK from alternate download location
   delegate_to: localhost
@@ -151,27 +164,21 @@
     url_password: "{{ keycloak_quarkus_download_pass | default(omit) }}"
     validate_certs: "{{ keycloak_quarkus_download_validate_certs | default(omit) }}"
 
-- name: Check downloaded archive
-  ansible.builtin.stat:
-    path: "{{ local_path.stat.path }}/{{ keycloak.bundle }}"
-  register: local_archive_path
-  delegate_to: localhost
-  become: false
-  run_once: true
-
 ## copy and unpack
+# Controller bundle path: prereqs register local_path with run_once on ansible_play_hosts[0] only — use that host
+# for src so every target (incl. HA members) resolves the same path. Do not gate copy on a separate stat (CI saw
+# false negatives so unarchive never ran). Missing src fails the copy task with a clear error.
 - name: Copy archive to target nodes
   ansible.builtin.copy:
-    src: "{{ local_path.stat.path }}/{{ keycloak.bundle }}"
+    src: "{{ _keycloak_quarkus_bundle_src }}"
     dest: "{{ archive }}"
     owner: "{{ keycloak.service_user }}"
     group: "{{ keycloak.service_group }}"
     mode: '0640'
   register: new_version_downloaded
-  when:
-    - not archive_path.stat.exists
-    - local_archive_path.stat is defined
-    - local_archive_path.stat.exists
+  vars:
+    _keycloak_quarkus_bundle_src: "{{ hostvars[ansible_play_hosts[0]].local_path.stat.path }}/{{ keycloak.bundle }}"
+  when: not archive_path.stat.exists
   become: true
 
 - name: "Check target directory: {{ keycloak.home }}/bin/"
@@ -190,15 +197,38 @@
     group: "{{ keycloak.service_group }}"
   become: true
   when:
-    - (not path_to_workdir.stat.exists) or new_version_downloaded.changed
+    - (archive_path.stat.exists or (new_version_downloaded is defined and new_version_downloaded.changed | default(false)))
+    - (not path_to_workdir.stat.exists) or (new_version_downloaded is defined and new_version_downloaded.changed | default(false))
   notify:
     - restart keycloak
+
+- name: Ensure extracted directory matches expected installdir (e.g. rhbk-* or keycloak-* -> keycloak_quarkus_installdir)
+  ansible.builtin.shell: |
+    set -eo pipefail
+    expected="{{ keycloak_quarkus_installdir }}"
+    parent="{{ keycloak_quarkus_dest }}"
+    if [ ! -d "$expected" ]; then
+      found=$(find "$parent" -maxdepth 1 -type d ! -path "$parent" | head -n 1)
+      if [ -n "$found" ] && [ -f "$found/bin/kc.sh" ]; then
+        mv "$found" "$expected"
+        echo "KEYCLOAK_QUARKUS_INSTALDIR_RENAMED"
+      fi
+    fi
+  args:
+    executable: /bin/bash
+  register: keycloak_quarkus_rename_installdir
+  changed_when: "'KEYCLOAK_QUARKUS_INSTALDIR_RENAMED' in (keycloak_quarkus_rename_installdir.stdout | default(''))"
+  become: true
+  when:
+    - (archive_path.stat.exists or (new_version_downloaded is defined and new_version_downloaded.changed | default(false)))
+    - (not path_to_workdir.stat.exists) or (new_version_downloaded is defined and new_version_downloaded.changed | default(false))
 
 - name: Inform decompression was not executed
   ansible.builtin.debug:
     msg: "{{ keycloak.home }} already exists and version unchanged, skipping decompression"
   when:
-    - (not new_version_downloaded.changed) and path_to_workdir.stat.exists
+    - path_to_workdir.stat.exists
+    - (new_version_downloaded.skipped | default(false)) or not (new_version_downloaded.changed | default(false) | bool)
 
 - name: "Copy private key to target"
   ansible.builtin.copy:

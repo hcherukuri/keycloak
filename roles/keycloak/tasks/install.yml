@@ -105,6 +105,8 @@
     - not archive_path.stat.exists
     - sso_enable is defined and sso_enable
     - not keycloak_offline_install
+    - rhn_username is defined
+    - rhn_password is defined
   block:
     - name: Retrieve product download using JBoss Network API
       middleware_automation.common.product_search:
@@ -120,19 +122,31 @@
 
     - name: Determine install zipfile from search results
       ansible.builtin.set_fact:
-        rhn_filtered_products: "{{ rhn_products.results | selectattr('file_path', 'match', '[^/]*/' + sso_archive + '$') }}"
+        rhn_filtered_products: "{{ rhn_products.results | selectattr('file_path', 'match', '(.*/)?' + sso_archive + '$') | list }}"
       delegate_to: localhost
       run_once: true
+
+    - name: Fail when no Red Hat Single Sign-On product matches
+      ansible.builtin.fail:
+        msg: >-
+          No RH-SSO product found for archive '{{ sso_archive }}' (version {{ sso_version }}, product_version {{ sso_version.split('.')[:2] | join('.') }}).
+          Check sso_version, sso_archive, and rhn_username/rhn_password for product category '{{ sso_product_category }}'.
+          Search returned {{ rhn_products.results | default([]) | length }} product(s).
+      when: rhn_filtered_products | length == 0
 
     - name: Download Red Hat Single Sign-On
       middleware_automation.common.product_download: # noqa risky-file-permissions delegated, uses controller host user
         client_id: "{{ rhn_username }}"
         client_secret: "{{ rhn_password }}"
         product_id: "{{ (rhn_filtered_products | first).id }}"
+        product_category: "{{ sso_product_category }}"
+        product_type: DISTRIBUTION
+        product_version: "{{ sso_version.split('.')[:2] | join('.') }}"
         dest: "{{ local_path.stat.path }}/{{ keycloak.bundle }}"
       no_log: "{{ omit_rhn_output | default(true) }}"
       delegate_to: localhost
       run_once: true
+      when: rhn_filtered_products | length > 0
 
 - name: Download rhsso archive from alternate location
   ansible.builtin.get_url: # noqa risky-file-permissions delegated, uses controller host user
